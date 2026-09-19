@@ -1,2 +1,1 @@
-{"outputDirectory":"public","functions":{"api/*.js":{"maxDuration":10}}}
-
+{"functions":{"api/*.js":{"maxDuration":10}}}
