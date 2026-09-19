@@ -1,0 +1,113 @@
+const Pusher = require('pusher');
+
+const pusher = new Pusher({
+  appId: process.env.PUSHER_APP_ID,
+  key: process.env.PUSHER_KEY,
+  secret: process.env.PUSHER_SECRET,
+  cluster: process.env.PUSHER_CLUSTER,
+  useTLS: true
+});
+
+const rooms = global._rooms || (global._rooms = {});
+
+function genCode() {
+  return Math.random().toString(36).substring(2, 8).toUpperCase();
+}
+
+function computeResults(room) {
+  const rnd = room.rounds[room.currentRound];
+  const impostors = rnd.impostors;
+  const players = room.players.map(p => p.name);
+  const roundScores = {};
+  players.forEach(p => roundScores[p] = 0);
+  players.forEach(voter => {
+    if (!room.votes[voter] || impostors.includes(voter)) return;
+    room.votes[voter].forEach(guessed => {
+      if (impostors.includes(guessed)) {
+        roundScores[voter] += 2;
+        roundScores[guessed] -= 2;
+      }
+    });
+  });
+  impostors.forEach(imp => {
+    const notCaught = players.filter(p =>
+      !impostors.includes(p) && room.votes[p] && !room.votes[p].includes(imp)
+    ).length;
+    roundScores[imp] += notCaught;
+  });
+  room.roundScores = roundScores;
+  players.forEach(p => { room.scores[p] = (room.scores[p] || 0) + roundScores[p]; });
+}
+
+module.exports = async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.status(200).end();
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+
+  const { action, ...data } = req.body;
+
+  try {
+    switch (action) {
+
+      case 'create_room': {
+        const { hostName, totalPlayers } = data;
+        const code = genCode();
+        rooms[code] = {
+          code, totalPlayers, created: Date.now(),
+          players: [{ name: hostName, isHost: true }],
+          scores: { [hostName]: 0 },
+          phase: 'lobby', rounds: [], currentRound: 0,
+          stopVotes: [], votes: {}
+        };
+        return res.json({ ok: true, code, room: rooms[code] });
+      }
+
+      case 'join_room': {
+        const { name, code } = data;
+        const room = rooms[code];
+        if (!room) return res.json({ ok: false, error: 'Sala no encontrada' });
+        if (room.phase !== 'lobby') return res.json({ ok: false, error: 'La partida ya comenzó' });
+        if (room.players.some(p => p.name === name)) return res.json({ ok: false, error: 'Nombre ya en uso' });
+        room.players.push({ name, isHost: false });
+        room.scores[name] = 0;
+        await pusher.trigger(`room-${code}`, 'lobby_update', room);
+        return res.json({ ok: true, room });
+      }
+
+      case 'start_game': {
+        const { code, roundsConfig } = data;
+        const room = rooms[code];
+        if (!room) return res.json({ ok: false, error: 'Sala no encontrada' });
+        const players = room.players.map(p => p.name);
+        room.rounds = roundsConfig.map(cfg => {
+          const n = Math.min(cfg.impostors, players.length - 2);
+          const shuffled = [...players].sort(() => Math.random() - 0.5);
+          const impostors = shuffled.slice(0, n);
+          const assignments = {};
+          players.forEach(p => {
+            assignments[p] = impostors.includes(p)
+              ? { role: 'impostor', genre: cfg.impostorGenre }
+              : { role: 'titular', genre: cfg.titularGenre };
+          });
+          return { numImpostors: n, titularGenre: cfg.titularGenre, impostorGenre: cfg.impostorGenre, impostors, assignments };
+        });
+        room.phase = 'playing';
+        room.currentRound = 0;
+        room.stopVotes = [];
+        room.votes = {};
+        await pusher.trigger(`room-${code}`, 'game_started', room);
+        return res.json({ ok: true });
+      }
+
+      case 'vote_stop': {
+        const { code, name } = data;
+        const room = rooms[code];
+        if (!room || room.stopVotes.includes(name)) return res.json({ ok: true });
+        room.stopVotes.push(name);
+        const needed = Math.max(1, room.players.length - 2);
+        await pusher.trigger(`room-${code}`, 'stop_update', { votes: room.stopVotes.length, needed });
+        if (room.stopVotes.length >= needed) {
+          room.phase = 'voting';
+          await pusher.trigger(`room-${code}`, 'round_stopped', {
