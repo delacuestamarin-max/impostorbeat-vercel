@@ -1,1 +1,2 @@
-{"functions":{"api/*.js":{"maxDuration":10}}}
+{"functions":{"_api/*.js":{"maxDuration":10}}}
+
